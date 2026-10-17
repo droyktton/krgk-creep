@@ -1,0 +1,5 @@
+*.o
+VMC
+build/
+runs/
+*.dat
