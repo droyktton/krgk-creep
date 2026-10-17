@@ -1,11 +1,11 @@
-# creep-T0plus-bubble
+# krgk-creep
 
-Creep dynamics of an elastic line in a random potential in the limit T → 0⁺, with the exact transition-pathway algorithm of Kolton, Rosso, Giamarchi and Krauth (KRGK) [1, 2]:
+Creep dynamics of a directed elastic line in a random potential in the limit T → 0⁺, with the exact transition-pathway algorithm of Kolton, Rosso, Giamarchi and Krauth (KRGK) [1, 2]:
 
 - the line goes from one metastable state to the next lower one through the path of minimal energy barrier;
 - each step is a thermally activated event: an optimal excitation of size L_opt followed by a deterministic relaxation (avalanche) of size L_rel.
 
-The goal of the project is to run the same dynamics for a straight wall and for an expanding circular domain (bubble). The question is whether the bubble geometry changes the roughness exponent in deep creep (H ≪ H_d), a regime Langevin dynamics cannot reach. See [Plan](#plan-bubble-geometry).
+This repository keeps the original code and a clean, faster reimplementation of its creep driver for a directed line (a domain wall in a thin film), with a regression test between the two. It reaches deep creep (H ≪ H_d), where Langevin dynamics is too slow. A possible extension to closed, expanding domains is sketched [at the end](#possible-extension-expanding-domains).
 
 ## Contents
 
@@ -111,19 +111,21 @@ Found while porting it (2026-10-17). The bugs are fixed in `src/krgk_creep.cpp`,
 2. **Upper bound on the barrier.** Find a cheap first path, for example with the approximate searches of `find_Besc2`, and use its barrier to prune children with E − E(α) above it. This is the role of the unused `Wmax` argument of the original.
 3. **Faster forward relaxation.** Each move scans all O(L²) blocks from the shortest. By no-passing, the forward relaxation ends in the same metastable state whatever the order of the moves. That holds for single-site moves, and should be checked for block moves before relying on it. Local updates and a list of unstable sites would then make it O(L) per move.
 4. **Non-periodic disorder in u.** With period M, after the line advances by M the sequence of events repeats exactly. Long runs need M much larger than the total advance, or disorder generated on demand, for example a hash of (i, j) with a counter-based generator.
-5. **Correlated or isotropic disorder.** Needed for the bubble geometry (below), and to set ξ independently of the lattice.
+5. **Correlated or isotropic disorder.** Needed for the extension to expanding domains (below), and to set ξ independently of the lattice.
 
-## Plan: bubble geometry
+## Possible extension: expanding domains
+
+The code is for directed lines. To compare with experiments on expanding circular domains (bubbles), the same dynamics could be run on a closed line:
 
 1. Make the move and energy code geometry-agnostic, and add a polar line R(θ_i), θ_i = 2πi/N, periodic in θ.
-2. Use the same form of energy in both geometries, with arc element a_i = a (straight) or R_i·Δθ (bubble):
-   - elastic: c Σ √(a_i² + Δ_i²), or its expansion c Σ [a_i + Δ_i²/(2a_i)]. In the bubble the first term gives the Laplace pressure;
+2. Use the same form of energy in both geometries, with arc element a_i = a (directed line) or R_i·Δθ (closed line):
+   - elastic: c Σ √(a_i² + Δ_i²), or its expansion c Σ [a_i + Δ_i²/(2a_i)]. For a closed line the first term gives the Laplace pressure;
    - drive: −H × (swept area);
    - pinning: Σ a_i V(r_i), with V an isotropic random field in the plane (correlation length ξ), sampled at the position of each site. The disorder does not live on the computational grid, so the polar grid adds no anisotropy.
 3. Transverse step δ ≪ ξ. Arc spacing a_i ≲ ξ, either with N fixed by the final radius or doubled as R grows (explicit dilution).
 4. Measure w²(ℓ) and ζ at equal age, overhangs, and events (L_opt, sizes, cluster shapes) with the tools of `driven-magnetic-DW-persistence`.
 
-No velocity enters the T → 0⁺ dynamics, so there is no geometric KPZ term. Any difference between bubble and straight wall would therefore be purely geometric (dilution, curvature).
+No velocity enters the T → 0⁺ dynamics, so there is no geometric KPZ term. Any difference between closed and directed lines would therefore be purely geometric (dilution, curvature).
 
 ## References
 
