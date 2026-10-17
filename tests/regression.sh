@@ -23,7 +23,7 @@ echo 12345 > "$W"/orig/idum.dat
 (cd "$W"/orig && timeout "$SECS" ../VMC -o <<< "64 1 16 1.0 0.08 1 2.0 -1.0 0.0 0" > /dev/null || true)
 n=$(($(wc -l < "$W"/orig/events.dat) - 1))
 [ "$n" -ge 5 ] || { echo "FAIL: the original produced only $n events in $SECS s"; exit 1; }
-"$ROOT"/build/krgk_creep --L 16 --M 64 --mcut 1 --disorder 1.0 --c 2.0 --f 0.08 --seed 12345 --events "$n" --out "$W"/new
+"$ROOT"/build/krgk_creep --rng mt --L 16 --M 64 --mcut 1 --disorder 1.0 --c 2.0 --f 0.08 --seed 12345 --events "$n" --out "$W"/new
 
 # original events.dat: L_rel area zlow zhigh barrier L_opt (6 significant digits)
 # new events.dat:      step barrier L_opt L_rel area mean_u E expanded

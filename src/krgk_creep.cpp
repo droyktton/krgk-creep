@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -26,6 +27,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <Random123/philox.h>
 
 static const double BIG = 1e300;
 static const double PRECISION_FC = 0.005;  // step in F when locating F_c (as in the original)
@@ -35,9 +37,12 @@ struct Params {
 	double disorder = 1.0, c = 2.0, f = 0.08;
 	bool f_absolute = false;
 	unsigned long seed = 12345;
+	bool philox = true;       // disorder on demand (Random123 Philox); false: Mersenne Twister table
+	int xi_x = 1, xi_u = 1;   // Philox disorder constant on rectangles of xi_x sites by xi_u in u
 	long events = 100;
 	double advance = 0;       // stop earlier, once the mean position has advanced by this much
 	int limit = 5;            // search envelope: u_i <= alpha_i + limit*M
+	int envelope = 0;         // search envelope in sites, instead of limit*M (needed with M = 0)
 	int conf_every = 0;       // write the metastable configuration every n events (0: never)
 	bool save_events = false; // write alpha, saddle, beta and gamma of every event
 	bool ground = false;      // compute the ground state at F = 0
@@ -72,11 +77,26 @@ class Line {
 public:
 	int L, M, mcut;
 	double c, F = 0.0;
-	std::vector<double> V;  // V[i*M + j]
+	bool philox;
+	int xi_x, xi_u;
+	double strength;
+	r123::Philox4x32::key_type pkey;  // Philox key, from the seed
+	std::vector<double> V;  // V[i*M + j], table of the Mersenne Twister disorder (--rng mt)
+	// Philox disorder: cache of V(s, x) for x in [base_s, base_s + W) at each site, refilled when
+	// the line leaves it (rebase); outside the band V is computed directly
+	static const int W = 196;
+	std::vector<double> band;
+	std::vector<int> base;
 	std::vector<int> u;
 
-	Line(const Params &p) : L(p.L), M(p.M), mcut(p.mcut), c(p.c), V((size_t)p.L * p.M), u(p.L, 0)
+	Line(const Params &p) : L(p.L), M(p.M), mcut(p.mcut), c(p.c), philox(p.philox), xi_x(p.xi_x), xi_u(p.xi_u), strength(p.disorder),
+		pkey{{(uint32_t)p.seed, (uint32_t)(p.seed >> 32)}}, V(p.philox ? 0 : (size_t)p.L * p.M), u(p.L, 0)
 	{
+		if (philox) {
+			band.resize((size_t)L * W);
+			base.assign(L, INT32_MIN / 2);
+			return;
+		}
 		Random rng(p.seed);
 		for (auto &v : V) v = rng.gauss();
 		double mean = 0.0;
@@ -85,7 +105,41 @@ public:
 		for (auto &v : V) v = (v - mean) * p.disorder;
 	}
 
-	double pot(int i, int j) const { int m = j % M; if (m < 0) m += M; return V[(size_t)i * M + m]; }
+	double pot(int i, int j) const
+	{
+		if (philox) {
+			unsigned x = (unsigned)(j - base[i]);
+			if (x < (unsigned)W) return band[(size_t)i * W + x];
+		}
+		return pot_raw(i, j);
+	}
+
+	double pot_raw(int i, int j) const
+	{
+		int m = j;
+		if (M > 0) { m = j % M; if (m < 0) m += M; }
+		if (!philox) return V[(size_t)i * M + m];
+		// one Gaussian amplitude per rectangle of xi_x sites by xi_u in u (floor division), by
+		// Box-Muller from two 64-bit uniforms in (0, 1) made of the four 32-bit outputs
+		int bi = i / xi_x, bu = m >= 0 ? m / xi_u : -((-m - 1) / xi_u) - 1;
+		r123::Philox4x32::ctr_type ctr = {{(uint32_t)bi, (uint32_t)bu, 0, 0}};
+		auto r = r123::Philox4x32()(ctr, pkey);
+		const double k = 1.0 / 9007199254740992.0;  // 2^-53
+		double u1 = ((double)((((uint64_t)r[0] << 32) | r[1]) >> 11) + 0.5) * k;
+		double u2 = ((double)((((uint64_t)r[2] << 32) | r[3]) >> 11) + 0.5) * k;
+		return strength * std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
+	}
+
+	// keep u_s - 4 .. u_s + W - 5 in the band of each site
+	void rebase()
+	{
+		if (!philox) return;
+		for (int s = 0; s < L; s++) {
+			if (u[s] - 4 >= base[s] && u[s] + W / 2 <= base[s] + W) continue;
+			base[s] = u[s] - 4;
+			for (int x = 0; x < W; x++) band[(size_t)s * W + x] = pot_raw(s, base[s] + x);
+		}
+	}
 
 	double energy(const std::vector<int> &x) const
 	{
@@ -238,11 +292,12 @@ public:
 	// the last configuration taken from the queue (before its relaxation into gamma), saddle is
 	// the highest-energy configuration taken from the queue (the one that sets the barrier), and
 	// the barrier max(E) - E(alpha) is returned; BIG if the envelope stops the search.
-	double creep_step(std::vector<int> &beta, std::vector<int> &saddle, int limit, long &expanded)
+	double creep_step(std::vector<int> &beta, std::vector<int> &saddle, int envelope, long &expanded)
 	{
+		rebase();
 		const std::vector<int> alpha = u;
 		std::vector<int> lim(L);
-		for (int i = 0; i < L; i++) lim[i] = alpha[i] + limit * M;
+		for (int i = 0; i < L; i++) lim[i] = alpha[i] + envelope;
 		const double E0 = energy(u);
 		double UB = 0.0, d;
 		std::set<Node> queue;
@@ -293,10 +348,13 @@ static void usage(const char *prog)
 	          << "  --c X          elastic constant                          [2.0]\n"
 	          << "  --f X          drive F/F_c (or F with --absolute)        [0.08]\n"
 	          << "  --absolute     --f is the absolute force F\n"
-	          << "  --seed N       random seed                               [12345]\n"
+	          << "  --seed N       seed of the disorder                      [12345]\n"
+	          << "  --rng G        disorder: philox (on demand) or mt (table) [philox]\n"
+	          << "  --xi-x A --xi-u B philox disorder constant on A x B rectangles  [1 1]\n"
 	          << "  --events N     number of creep steps                     [100]\n"
 	          << "  --advance X    stop once the mean position advanced by X [0: off]\n"
 	          << "  --limit N      search envelope u <= alpha + N*M          [5]\n"
+	          << "  --envelope N   search envelope u <= alpha + N (sites)    [limit*M]\n"
 	          << "  --conf-every N write the metastable state every N steps  [0: never]\n"
 	          << "  --save-events  write alpha, saddle, beta, gamma of every step to events.bin\n"
 	          << "  --ground       write the ground state at F = 0 to ground_state.dat\n"
@@ -317,6 +375,14 @@ int main(int argc, char **argv)
 		else if (o == "--f") p.f = std::stod(val());
 		else if (o == "--absolute") p.f_absolute = true;
 		else if (o == "--seed") p.seed = std::stoul(val());
+		else if (o == "--rng") {
+			std::string g = val();
+			if (g != "philox" && g != "mt") { usage(argv[0]); return 1; }
+			p.philox = g == "philox";
+		}
+		else if (o == "--envelope") p.envelope = std::stoi(val());
+		else if (o == "--xi-x") p.xi_x = std::stoi(val());
+		else if (o == "--xi-u") p.xi_u = std::stoi(val());
 		else if (o == "--events") p.events = std::stol(val());
 		else if (o == "--limit") p.limit = std::stoi(val());
 		else if (o == "--conf-every") p.conf_every = std::stoi(val());
@@ -326,25 +392,37 @@ int main(int argc, char **argv)
 		else if (o == "--out") p.out = val();
 		else { usage(argv[0]); return 1; }
 	}
-	if (p.L < 3 || p.M < 2 || p.mcut < 1) { std::cerr << "need L >= 3, M >= 2, mcut >= 1\n"; return 1; }
+	if (p.L < 3 || p.M < 0 || p.M == 1 || p.mcut < 1) { std::cerr << "need L >= 3, M = 0 or M >= 2, mcut >= 1\n"; return 1; }
+	if (p.M == 0 && (!p.philox || !p.f_absolute || p.envelope <= 0 || p.ground)) {
+		std::cerr << "M = 0 (no period) needs --rng philox, --absolute and --envelope, and no --ground\n";
+		return 1;
+	}
+	const int envelope = p.envelope > 0 ? p.envelope : p.limit * p.M;
 
+	if (p.xi_x < 1 || p.xi_u < 1 || p.L % p.xi_x || (p.M > 0 && p.M % p.xi_u) || (!p.philox && (p.xi_x > 1 || p.xi_u > 1))) {
+		std::cerr << "need xi_x, xi_u >= 1, xi_x dividing L and xi_u dividing M, and --rng philox if xi > 1\n";
+		return 1;
+	}
 	Line line(p);
 	// F_c is located starting from F = --f, as the original does (it reads F/F_c as the initial F).
-	std::vector<int> crit(p.L);
-	double Fc = line.critical_force(p.f, crit);
+	// It needs an advance of 2M, so it is skipped when the disorder is not periodic.
+	std::vector<int> crit;
+	double Fc = 0;
+	if (p.M > 0) { crit.resize(p.L); Fc = line.critical_force(p.f, crit); }
 	line.F = p.f_absolute ? p.f : p.f * Fc;
 	std::fill(line.u.begin(), line.u.end(), 0);
 	line.relax_forward();
 
 	std::ofstream log(p.out + "/params.txt");
 	log << "L " << p.L << "\nM " << p.M << "\nmcut " << p.mcut << "\ndisorder " << p.disorder << "\nc " << p.c
-	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed << "\nlimit " << p.limit
-	    << "\nFc " << Fc << "\nF " << line.F << std::endl;
+	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed
+	    << "\nrng " << (p.philox ? "philox" : "mt") << "\nxi_x " << p.xi_x << "\nxi_u " << p.xi_u << "\nenvelope " << envelope
+	    << "\nFc " << (p.M > 0 ? std::to_string(Fc) : "not computed") << "\nF " << line.F << std::endl;
 	auto write_conf = [&](const std::string &name, const std::vector<int> &x) {
 		std::ofstream o(p.out + "/" + name);
 		for (int v : x) o << v << "\n";
 	};
-	write_conf("critical.dat", crit);
+	if (p.M > 0) write_conf("critical.dat", crit);
 	if (p.ground) write_conf("ground_state.dat", line.ground_state());
 	std::ofstream ev(p.out + "/events.dat");
 	ev << "# step barrier L_opt L_rel area mean_u E expanded\n";
@@ -360,8 +438,8 @@ int main(int argc, char **argv)
 	for (long s = 1; s <= p.events; s++) {
 		alpha = line.u;
 		long expanded;
-		double UB = line.creep_step(beta, saddle, p.limit, expanded);
-		if (UB >= BIG) { std::cerr << "step " << s << ": no lower state inside the envelope (raise --limit)\n"; return 2; }
+		double UB = line.creep_step(beta, saddle, envelope, expanded);
+		if (UB >= BIG) { std::cerr << "step " << s << ": no lower state inside the envelope (raise --limit or --envelope)\n"; return 2; }
 		int Lopt = 0, Lrel = 0;
 		long area = 0, sum = 0;
 		for (int i = 0; i < p.L; i++) {

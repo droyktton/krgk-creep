@@ -16,6 +16,7 @@ This repository keeps the original code and a clean, faster reimplementation of 
 | `original/vmc/` | the original code (C++, Blitz++, serial), from `cuerdas_elasticas/vmc` (bitbucket `abk_balde/cuerdas_elasticas`, last change 2019), unmodified |
 | `original/common/` | helpers of that repository (the large safe-prime tables were left out) |
 | `demo/` | demo runs and figures (`demo/run_demo.sh`, `demo/plot_demo.py`, `demo/figures/`) |
+| `third_party/Random123/` | Philox headers of Random123 1.09, for the disorder on demand |
 | `original/patches/vmc-return.patch` | the one-line fix the original needs to run when compiled with optimisation (see [Review](#review-of-the-original-code)) |
 
 ## Build and run
@@ -31,15 +32,18 @@ Options (`build/krgk_creep --help`):
 | option | meaning | default |
 |---|---|---|
 | `--L` | line length (sites, periodic) | 16 |
-| `--M` | period of the disorder along u | 64 |
+| `--M` | period of the disorder along u; 0: not periodic (needs `--rng philox`, `--absolute` and `--envelope`) | 64 |
 | `--mcut` | maximal slope \|u_{i+1} − u_i\| | 1 |
 | `--disorder` | strength of the Gaussian disorder (std) | 1.0 |
 | `--c` | elastic constant | 2.0 |
 | `--f` | drive F/F_c (F with `--absolute`) | 0.08 |
-| `--seed` | random seed | 12345 |
+| `--seed` | seed of the disorder | 12345 |
+| `--rng` | disorder generated on demand (`philox`) or stored as a table (`mt`, as the original) | `philox` |
+| `--xi-x`, `--xi-u` | Philox disorder constant on rectangles of xi-x sites by xi-u along u | 1, 1 |
 | `--events` | number of creep steps | 100 |
 | `--advance` | stop earlier, once the mean position has advanced by this much | 0 (off) |
 | `--limit` | search envelope u ≤ α + limit·M | 5 |
+| `--envelope` | search envelope u ≤ α + envelope, in sites (instead of limit·M) | off |
 | `--conf-every` | write the metastable state every n steps to `configs.bin` (int32, L per record) | 0 (never) |
 | `--save-events` | write α, saddle, β and γ of every step to `events.bin` | off |
 | `--ground` | compute the ground state at F = 0 (`ground_state.dat`) | off |
@@ -66,7 +70,7 @@ Outputs:
 
 ## Demo
 
-`demo/run_demo.sh` runs the examples below (about 15 minutes with 3 parallel jobs) and `demo/plot_demo.py` makes the figures.
+`demo/run_demo.sh` runs the examples below with the table disorder (`--rng mt`) (about 15 minutes with 3 parallel jobs) and `demo/plot_demo.py` makes the figures.
 
 ### One disorder realization
 
@@ -113,7 +117,13 @@ Energy of the line u_i (integer, i = 0..L−1, periodic):
 
 E = Σ_i [ V(i, u_i mod M) − F u_i + (c/2)(u_{i+1} − u_i)² ],  with |u_{i+1} − u_i| ≤ mcut.
 
-The disorder is Gaussian and uncorrelated, with zero mean and strength `--disorder`. It is periodic in u with period M.
+The disorder is Gaussian, with zero mean and strength `--disorder`. It is periodic in u with period M, or not periodic with `--M 0`.
+
+- **On demand (`--rng philox`, default).** V(i, u) is computed when needed from the counter (i, u) and the seed. The generator is Philox4x32-10 of Random123 [4] (`third_party/Random123`, header-only, BSD license).
+  - The four 32-bit outputs make two 64-bit uniforms, and the Gaussian value comes from the Box–Muller formula.
+  - Nothing of size L·M is stored. Each site keeps a cache of V over a band of 196 values around the line, refilled at each step when the line leaves it.
+- **Correlated (`--xi-x a --xi-u b`, Philox only).** V(i, u) = g(⌊i/a⌋, ⌊u/b⌋): V is constant on rectangles of a sites by b along u, with independent Gaussian amplitudes. This sets the correlation lengths, possibly anisotropic, independently of the lattice. a must divide L and b must divide M.
+- **Table (`--rng mt`).** The disorder of the original code: Mersenne Twister numbers stored in an L·M table, minus their mean. The regression test and the demo use it.
 
 **Elementary moves.** A block of consecutive sites (from one site to the whole line) is displaced rigidly by ±1. The move is allowed if the two border slopes stay within mcut.
 
@@ -159,18 +169,23 @@ Found while porting it (2026-10-17). The bugs are fixed in `src/krgk_creep.cpp`,
 2. Each key stores a `vector<bitset<2>>`, which takes 8 bytes per slope (`sizeof(bitset<2>) == 8`). The 2-bit slopes are thus stored in 64 bits each. `krgk_creep` packs them into ⌈log₂(2·mcut+1)⌉ bits.
 3. The barrier search printed several lines per expansion (867 000 lines in one minute at L = 16).
 
-## Suggested improvements (not done yet)
+## Suggested improvements
+
+Items 1–3 are not done yet; items 4 and 5 are done (see [Model and algorithm](#model-and-algorithm)).
+
 
 1. **Lazy children.** Store (E, mother, block move) in the queue instead of the full child configuration, and build the child only when it is taken. The queue holds ~L² children per expansion; at L = 64 the memory (186 MB for 20 events) is the limit, not the time.
 2. **Upper bound on the barrier.** Find a cheap first path, for example with the approximate searches of `find_Besc2`, and use its barrier to prune children with E − E(α) above it. This is the role of the unused `Wmax` argument of the original.
 3. **Faster forward relaxation.** Each move scans all O(L²) blocks from the shortest. By no-passing, the forward relaxation ends in the same metastable state whatever the order of the moves. That holds for single-site moves, and should be checked for block moves before relying on it. Local updates and a list of unstable sites would then make it O(L) per move.
-4. **Non-periodic disorder in u.** With period M, after the line advances by M the sequence of events repeats exactly. Long runs need M much larger than the total advance, or disorder generated on demand, for example a hash of (i, j) with a counter-based generator.
-5. **Correlated disorder.** To set the correlation length ξ independently of the lattice.
+   - [creep-minimal-rearrangement](https://github.com/droyktton/creep-minimal-rearrangement) already relaxes with the same moves and order, but faster: block energies from prefix sums, blocks that touch no moved site skipped, and an O(L) test for whether any favourable block remains. It is tested against the plain scan, and can be ported here.
+4. **Non-periodic disorder in u** (done: `--rng philox --M 0`). With period M, after the line advances by M the sequence of events repeats exactly.
+5. **Correlated disorder** (done: `--xi-x`, `--xi-u`). It sets the correlation lengths independently of the lattice.
 
 ## References
 
 1. A. B. Kolton, A. Rosso, T. Giamarchi and W. Krauth, *Dynamics below the depinning threshold in disordered elastic systems*, Phys. Rev. Lett. **97**, 057001 (2006). doi:10.1103/PhysRevLett.97.057001
 2. A. B. Kolton, A. Rosso, T. Giamarchi and W. Krauth, *Creep dynamics of elastic manifolds via exact transition pathways*, Phys. Rev. B **79**, 184207 (2009). doi:10.1103/PhysRevB.79.184207
 3. E. E. Ferrero, L. Foini, T. Giamarchi, A. B. Kolton and A. Rosso, *Spatiotemporal patterns in ultraslow domain wall creep dynamics*, Phys. Rev. Lett. **118**, 147208 (2017). doi:10.1103/PhysRevLett.118.147208
+4. J. K. Salmon, M. A. Moraes, R. O. Dror and D. E. Shaw, *Parallel random numbers: as easy as 1, 2, 3*, Proc. SC11 (2011). doi:10.1145/2063384.2063405
 
 If you use this code, please cite [1] and [2].

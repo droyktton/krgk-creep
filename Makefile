@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra
+CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -isystem third_party
 
 build/krgk_creep: src/krgk_creep.cpp
 	@mkdir -p build

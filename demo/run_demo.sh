@@ -15,10 +15,10 @@ mkdir -p "$R"
 
 {
 	for f in 0.15 0.25 0.4 0.6 0.9; do
-		echo "--L 32 --M 64 --seed 7 --f $f --advance 192 --ground --out $R/single_f$f"
+		echo "--rng mt --L 32 --M 64 --seed 7 --f $f --advance 192 --ground --out $R/single_f$f"
 	done
 	for s in 1 2 3; do
-		echo "--L 64 --M 16384 --seed $s --f 0.6 --advance 6000 --out $R/stats_s$s"
+		echo "--rng mt --L 64 --M 16384 --seed $s --f 0.6 --advance 6000 --out $R/stats_s$s"
 	done
 } | xargs -P "${JOBS:-3}" -I{} bash -c 'set -- {}; mkdir -p "${!#}"; "$0" --events 1000000 --save-events "$@"' "$BIN"
 
