@@ -44,6 +44,7 @@ Options (`build/krgk_creep --help`):
 | `--advance` | stop earlier, once the mean position has advanced by this much | 0 (off) |
 | `--limit` | search envelope u ≤ α + limit·M | 5 |
 | `--envelope` | search envelope u ≤ α + envelope, in sites (instead of limit·M) | off |
+| `--no-cap` | search without the energy cap (same result, much more memory) | off |
 | `--conf-every` | write the metastable state every n steps to `configs.bin` (int32, L per record) | 0 (never) |
 | `--save-events` | write α, saddle, β and γ of every step to `events.bin` | off |
 | `--ground` | compute the ground state at F = 0 (`ground_state.dat`) | off |
@@ -136,7 +137,28 @@ The disorder is Gaussian, with zero mean and strength `--disorder`. It is period
 2. Stop at the first mother with E < E(α); that is γ.
 3. The barrier is U_B = max(E) − E(α) over the configurations taken from the queue. Because they leave the queue in order of energy, this is the minimal barrier among the forward paths [2].
 
-The search is restricted to u ≤ α + limit·M.
+The search is restricted to u ≤ α + limit·M (or α + envelope).
+
+**Implementation.** None of these choices changes the result; the regression test checks this against the original.
+- **Lazy children.** The queue is a binary heap of (E, mother, block move) entries, 24 bytes each; a child is built only when it is taken. The keys of the expanded configurations are kept in a hash set (closed set), so that none is expanded twice.
+- **Energy cap.** Children with E − E(α) above a cap U_cap are not queued.
+  - U_cap starts at twice the barrier of the previous step. If the queue runs out and some child was left out, the search is repeated with twice the cap.
+  - Once U_cap ≥ U_B, the configurations taken from the queue, in the same order, are those of the search without cap. The cap only keeps out of memory the many children that would never be taken.
+- **Relaxation.** The order of the moves is that of the original (shortest favourable block, then leftmost). Three things make it fast:
+  - block energies come from prefix sums of the site energies;
+  - blocks that touch no site changed since the last metastable state are skipped. After taking a child, only the moved block can be unstable, because its mother is metastable;
+  - whether any favourable block remains is decided in O(L). The energy change of a block is separable into a term for each border, so the minimum over all blocks is a sliding-window minimum.
+
+**Performance.** Measured on one desktop core with `--rng mt` and M = 1024, 20 or 30 events, against the previous version (closed set only). The events are identical.
+
+| case | previous | now |
+|---|---|---|
+| L = 64, f = 0.3, 30 events | 8.1 s, 100 MB | 3.0 s, 4.3 MB |
+| L = 128, f = 0.3, 20 events | 11.1 s, 67 MB | 4.2 s, 5.6 MB |
+| L = 64, f = 0.1, events in 300 s | 9, 2.3 GB | 18, 152 MB |
+| L = 256, f = 0.3, 20 events | not run | 189 s, 12 MB |
+
+Memory no longer limits the search. The time still grows quickly as f decreases and L grows, as expected from the exact search [2].
 
 ## Review of the original code
 
@@ -171,13 +193,12 @@ Found while porting it (2026-10-17). The bugs are fixed in `src/krgk_creep.cpp`,
 
 ## Suggested improvements
 
-Items 1–3 are not done yet; items 4 and 5 are done (see [Model and algorithm](#model-and-algorithm)).
+All done (see [Implementation](#model-and-algorithm)); each gives the same events as before, which the regression test checks.
 
 
-1. **Lazy children.** Store (E, mother, block move) in the queue instead of the full child configuration, and build the child only when it is taken. The queue holds ~L² children per expansion; at L = 64 the memory (186 MB for 20 events) is the limit, not the time.
-2. **Upper bound on the barrier.** Find a cheap first path, for example with the approximate searches of `find_Besc2`, and use its barrier to prune children with E − E(α) above it. This is the role of the unused `Wmax` argument of the original.
-3. **Faster forward relaxation.** Each move scans all O(L²) blocks from the shortest. By no-passing, the forward relaxation ends in the same metastable state whatever the order of the moves. That holds for single-site moves, and should be checked for block moves before relying on it. Local updates and a list of unstable sites would then make it O(L) per move.
-   - [creep-minimal-rearrangement](https://github.com/droyktton/creep-minimal-rearrangement) already relaxes with the same moves and order, but faster: block energies from prefix sums, blocks that touch no moved site skipped, and an O(L) test for whether any favourable block remains. It is tested against the plain scan, and can be ported here.
+1. **Lazy children** (done). Store (E, mother, block move) in the queue instead of the full child configuration, and build the child only when it is taken. The queue holds ~L² children per expansion; at L = 64 the memory (186 MB for 20 events) is the limit, not the time.
+2. **Upper bound on the barrier** (done, as an energy cap). Prune the children with E − E(α) above a bound of the barrier. This is the role of the unused `Wmax` argument of the original. Instead of a first path, the bound is a cap raised until the search succeeds, which is exact.
+3. **Faster forward relaxation** (done). Each move scanned all O(L²) blocks from the shortest. Now it keeps the same moves and order, with prefix sums, skipped clean blocks and an O(L) test. This is the relaxation of [creep-minimal-rearrangement](https://github.com/droyktton/creep-minimal-rearrangement), tested there against the plain scan.
 4. **Non-periodic disorder in u** (done: `--rng philox --M 0`). With period M, after the line advances by M the sequence of events repeats exactly.
 5. **Correlated disorder** (done: `--xi-x`, `--xi-u`). It sets the correlation lengths independently of the lattice.
 

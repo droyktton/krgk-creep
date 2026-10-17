@@ -23,7 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
-#include <set>
+#include <queue>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -46,6 +46,7 @@ struct Params {
 	int conf_every = 0;       // write the metastable configuration every n events (0: never)
 	bool save_events = false; // write alpha, saddle, beta and gamma of every event
 	bool ground = false;      // compute the ground state at F = 0
+	bool no_cap = false;      // search without energy cap (same result, more memory)
 	std::string out = ".";
 };
 
@@ -88,9 +89,13 @@ public:
 	std::vector<double> band;
 	std::vector<int> base;
 	std::vector<int> u;
+	std::vector<char> dirty;    // sites changed since the last metastable state
+	std::vector<double> ds, P;  // site-energy change of a move of each site, and its prefix sums (2L)
+	std::vector<int> D;         // prefix counts of dirty sites (2L)
 
 	Line(const Params &p) : L(p.L), M(p.M), mcut(p.mcut), c(p.c), philox(p.philox), xi_x(p.xi_x), xi_u(p.xi_u), strength(p.disorder),
-		pkey{{(uint32_t)p.seed, (uint32_t)(p.seed >> 32)}}, V(p.philox ? 0 : (size_t)p.L * p.M), u(p.L, 0)
+		pkey{{(uint32_t)p.seed, (uint32_t)(p.seed >> 32)}}, V(p.philox ? 0 : (size_t)p.L * p.M), u(p.L, 0),
+		dirty(p.L, 1), ds(p.L), P(2 * p.L + 1), D(2 * p.L + 1)
 	{
 		if (philox) {
 			band.resize((size_t)L * W);
@@ -169,19 +174,70 @@ public:
 		return true;
 	}
 
-	// One elementary move in direction dir: applies the first block move (shortest first, then
-	// leftmost) that lowers the energy. Returns the smallest energy change per moved site among
-	// the moves tried; it is negative if and only if a move was made.
-	double move(int dir)
+	// ---- elementary moves ----
+	// One elementary move in direction dir applies the first block move, in the order (il, i),
+	// that lowers the energy (shortest first, then leftmost), as in the original. Block energies
+	// come from prefix sums of the site terms; blocks that touch no site changed since the last
+	// metastable state (dirty) cannot have become favourable and are skipped, and whether any
+	// favourable block exists is decided first in O(L) (lowest_move).
+	void touch_all() { std::fill(dirty.begin(), dirty.end(), 1); }
+
+	void prefix(int dir)
 	{
-		double dmin = BIG, d;
+		rebase();  // the moves read V at u and u +- 1
+		for (int s = 0; s < L; s++) ds[s] = pot(s, u[s] + dir) - pot(s, u[s]) - dir * F;
+		P[0] = 0; D[0] = 0;
+		for (int s = 0; s < 2 * L; s++) { P[s + 1] = P[s] + ds[s % L]; D[s + 1] = D[s] + dirty[s % L]; }
+	}
+
+	// Lowest energy change over all block moves (i, il), 2 <= il <= L, and the rigid move, in O(L).
+	// With e = i + il the energy change is separable, d = A(i) + B(e):
+	//   A(i) = c (1 + dir (u_{i+1} - u_i)) - P[i+1],  B(e) = c dir (u_{e-1} - u_e) + P[e],
+	// each term defined only if its border slope stays within mcut; the minimum over
+	// e in [i+2, i+L] is a sliding-window minimum.
+	double lowest_move(int dir) const
+	{
+		auto at = [&](int s) { return u[s % L]; };
+		std::vector<double> B(2 * L);
+		for (int e = 2; e < 2 * L; e++)
+			B[e] = std::abs(at(e - 1) + dir - at(e)) > mcut ? BIG : c * dir * (at(e - 1) - at(e)) + P[e];
+		double best = P[L];
+		std::vector<int> q(2 * L);  // deque of indices e with increasing B
+		int h = 0, t = 0, next = 2;
+		for (int i = 0; i < L; i++) {
+			for (; next <= i + L; next++) {
+				while (t > h && B[q[t - 1]] >= B[next]) t--;
+				q[t++] = next;
+			}
+			while (q[h] < i + 2) h++;
+			if (std::abs(at(i + 1) + dir - u[i]) > mcut || B[q[h]] >= BIG) continue;
+			best = std::min(best, c * (1.0 + dir * (at(i + 1) - u[i])) - P[i + 1] + B[q[h]]);
+		}
+		return best;
+	}
+
+	// One elementary move in direction dir. Returns the smallest energy change per moved site
+	// among the moves tried (all moves if full); it is negative if and only if a move was made.
+	double move(int dir, bool full)
+	{
+		prefix(dir);
+		if (!full && (D[L] == 0 || lowest_move(dir) > 1e-9)) return BIG;  // no favourable move
+		double dmin = BIG;
 		for (int il = 2; il <= L + 1; il++) {
 			int nstart = (il <= L) ? L : 1;
 			for (int i = 0; i < nstart; i++) {
-				if (!block(u, dir, i, il, d, nullptr)) continue;
+				double d;
+				if (il <= L) {
+					if (!full && D[i + il + 1] - D[i] == 0) continue;  // sites i .. i+il clean
+					int istop = (i + il) % L, a = u[(i + 1) % L], b = u[(istop - 1 + L) % L];
+					if (std::abs(a + dir - u[i]) > mcut || std::abs(b + dir - u[istop]) > mcut) continue;
+					d = c * (1.0 + dir * (a - u[i] + b - u[istop])) + P[i + il] - P[i + 1];
+				} else d = P[L];
 				dmin = std::min(dmin, d / (il - 1));
 				if (d < 0) {
-					for (int j = 1; j < il; j++) u[(i + j) % L] += dir;
+					int n = (il <= L) ? il - 1 : L;
+					for (int j = 1; j <= n; j++) { int s = (i + j) % L; u[s] += dir; dirty[s] = 1; }
+					if (il <= L) { dirty[i] = 1; dirty[(i + il) % L] = 1; }
 					return dmin;
 				}
 			}
@@ -189,7 +245,12 @@ public:
 		return dmin;
 	}
 
-	void relax_forward() { while (move(+1) < 0.0) {} }
+	// relax forward to the next metastable state; only the dirty sites can be unstable
+	void relax_forward()
+	{
+		while (move(+1, false) < 0.0) {}
+		std::fill(dirty.begin(), dirty.end(), 0);
+	}
 
 	// Critical force with the procedure of the original (find_critical): starting from u = 0 and
 	// the initial F, relax backward; then advance forward by 2M, raising F by (dmin + PRECISION_FC)
@@ -199,18 +260,19 @@ public:
 	{
 		F = F0;
 		std::fill(u.begin(), u.end(), 0);
-		while (move(-1) < 0.0) {}
+		while (move(-1, true) < 0.0) {}
 		F -= 5.0 * PRECISION_FC;
 		int count = 0;
 		while (count == 0) {
 			std::vector<int> u0 = u;
 			auto advanced = [&]() { int m = u[0] - u0[0]; for (int i = 1; i < L; i++) m = std::min(m, u[i] - u0[i]); return m; };
 			while (advanced() < 2 * M) {
-				double d = move(+1);
+				double d = move(+1, true);
 				if (d >= 0.0) { F += d + PRECISION_FC; count++; crit = u; }
 			}
 			if (count == 0) { F -= 5.0 * PRECISION_FC; for (auto &x : u) x -= 2 * M; }
 		}
+		touch_all();
 		return F - PRECISION_FC;
 	}
 
@@ -282,26 +344,50 @@ public:
 		return x;
 	}
 
-	struct Node {
+	// Queue entry (lazy child): the block move (i, il) by +1 of the metastable mother number m,
+	// with the energy E of the child; the child is built only when it is taken from the queue.
+	struct Child {
 		double E;
-		std::string k;
-		bool operator<(const Node &o) const { return E < o.E || (E == o.E && k < o.k); }
+		int m, i, il;
+		bool operator>(const Child &o) const
+		{
+			if (E != o.E) return E > o.E;
+			if (m != o.m) return m > o.m;
+			return i != o.i ? i > o.i : il > o.il;
+		}
 	};
 
 	// Creep step from the current (metastable) configuration alpha. On return u is gamma, beta is
 	// the last configuration taken from the queue (before its relaxation into gamma), saddle is
 	// the highest-energy configuration taken from the queue (the one that sets the barrier), and
 	// the barrier max(E) - E(alpha) is returned; BIG if the envelope stops the search.
-	double creep_step(std::vector<int> &beta, std::vector<int> &saddle, int envelope, long &expanded)
+	// Children with E - E(alpha) above cap are not queued. If the search then fails, it is
+	// repeated with a larger cap; once cap >= U_B the configurations taken from the queue, in
+	// the same order, are those of the search without cap, so the result does not depend on it.
+	double creep_step(std::vector<int> &beta, std::vector<int> &saddle, int envelope, long &expanded, double cap)
 	{
 		rebase();
 		const std::vector<int> alpha = u;
+		for (;;) {
+			bool pruned = false;
+			double UB = search(alpha, beta, saddle, envelope, expanded, cap, pruned);
+			if (UB < BIG || !pruned) return UB;
+			u = alpha;
+			cap *= 2;
+		}
+	}
+
+	double search(const std::vector<int> &alpha, std::vector<int> &beta, std::vector<int> &saddle, int envelope,
+	              long &expanded, double cap, bool &pruned)
+	{
 		std::vector<int> lim(L);
 		for (int i = 0; i < L; i++) lim[i] = alpha[i] + envelope;
 		const double E0 = energy(u);
 		double UB = 0.0, d;
-		std::set<Node> queue;
+		std::priority_queue<Child, std::vector<Child>, std::greater<Child>> queue;
+		std::vector<std::string> mothers;  // keys of the metastable mothers, by number
 		std::unordered_set<std::string> closed;
+		std::vector<int> x(L);
 		expanded = 0;
 		do {
 			// children of the current metastable mother u
@@ -309,29 +395,39 @@ public:
 			for (int i = 0; i < L; i++) inside = inside && u[i] <= lim[i];
 			if (inside) {
 				double Em = energy(u);
+				int m = (int)mothers.size();
+				mothers.push_back(key(u));
 				for (int il = 2; il <= L + 1; il++) {
 					int nstart = (il <= L) ? L : 1;
 					for (int i = 0; i < nstart; i++) {
 						if (!block(u, +1, i, il, d, &lim)) continue;
-						std::vector<int> x = u;
+						x = u;
 						for (int j = 1; j < il; j++) x[(i + j) % L] += 1;
-						std::string k = key(x);
-						if (!closed.count(k)) queue.insert({Em + d, std::move(k)});
+						if (Em + d - E0 > cap) { pruned = true; continue; }
+						if (!closed.count(key(x))) queue.push({Em + d, m, i, il});
 					}
 				}
 			}
 			// lowest-energy configuration not expanded yet
-			Node n;
+			Child n;
+			std::string k;
 			do {
 				if (queue.empty()) { u = alpha; return BIG; }
-				n = *queue.begin();
-				queue.erase(queue.begin());
-			} while (closed.count(n.k));
-			closed.insert(n.k);
+				n = queue.top();
+				queue.pop();
+				x = unkey(mothers[n.m]);
+				for (int j = 1; j < n.il; j++) x[(n.i + j) % L] += 1;
+				k = key(x);
+			} while (closed.count(k));
+			closed.insert(std::move(k));
 			expanded++;
-			u = unkey(n.k);
+			u = x;
 			if (n.E - E0 > UB || expanded == 1) { UB = std::max(UB, n.E - E0); saddle = u; }
 			beta = u;
+			// only the moved block and its borders can be unstable (the mother was metastable)
+			std::fill(dirty.begin(), dirty.end(), 0);
+			if (n.il <= L) for (int j = 0; j <= n.il; j++) dirty[(n.i + j) % L] = 1;
+			else touch_all();
 			relax_forward();
 		} while (energy(u) > E0);
 		return UB;
@@ -355,6 +451,7 @@ static void usage(const char *prog)
 	          << "  --advance X    stop once the mean position advanced by X [0: off]\n"
 	          << "  --limit N      search envelope u <= alpha + N*M          [5]\n"
 	          << "  --envelope N   search envelope u <= alpha + N (sites)    [limit*M]\n"
+	          << "  --no-cap       no energy cap in the search (same result, more memory)\n"
 	          << "  --conf-every N write the metastable state every N steps  [0: never]\n"
 	          << "  --save-events  write alpha, saddle, beta, gamma of every step to events.bin\n"
 	          << "  --ground       write the ground state at F = 0 to ground_state.dat\n"
@@ -381,6 +478,7 @@ int main(int argc, char **argv)
 			p.philox = g == "philox";
 		}
 		else if (o == "--envelope") p.envelope = std::stoi(val());
+		else if (o == "--no-cap") p.no_cap = true;
 		else if (o == "--xi-x") p.xi_x = std::stoi(val());
 		else if (o == "--xi-u") p.xi_u = std::stoi(val());
 		else if (o == "--events") p.events = std::stol(val());
@@ -411,6 +509,7 @@ int main(int argc, char **argv)
 	if (p.M > 0) { crit.resize(p.L); Fc = line.critical_force(p.f, crit); }
 	line.F = p.f_absolute ? p.f : p.f * Fc;
 	std::fill(line.u.begin(), line.u.end(), 0);
+	line.touch_all();
 	line.relax_forward();
 
 	std::ofstream log(p.out + "/params.txt");
@@ -433,12 +532,14 @@ int main(int argc, char **argv)
 	if (p.save_events) evconf.open(p.out + "/events.bin", std::ios::binary);
 
 	std::vector<int> alpha, beta(p.L), saddle(p.L);
+	double cap = BIG;  // cap of the search: twice the previous barrier
 	double u_start = 0;
 	for (int v : line.u) u_start += (double)v / p.L;
 	for (long s = 1; s <= p.events; s++) {
 		alpha = line.u;
 		long expanded;
-		double UB = line.creep_step(beta, saddle, envelope, expanded);
+		double UB = line.creep_step(beta, saddle, envelope, expanded, cap);
+		cap = p.no_cap ? BIG : 2 * std::max(UB, 1e-3);
 		if (UB >= BIG) { std::cerr << "step " << s << ": no lower state inside the envelope (raise --limit or --envelope)\n"; return 2; }
 		int Lopt = 0, Lrel = 0;
 		long area = 0, sum = 0;
