@@ -110,7 +110,7 @@ L = 64, f = 0.6, three realizations, M = 16384 so that the disorder never repeat
 - (e) Area against L_rel.
 - (f) U_B against L_opt.
 
-At this drive the excitations are small (L_opt mostly 1–10 sites) and their barrier hardly depends on L_opt. The asymptotic creep regime needs L_opt ≫ 1, that is lower f and larger L. Lazy children (below) are the first step to make that affordable.
+At this drive the excitations are small (L_opt mostly 1–10 sites) and their barrier hardly depends on L_opt. The asymptotic creep regime needs L_opt ≫ 1, that is lower f and larger L, where the search time grows quickly (see [Performance](#model-and-algorithm)).
 
 ## Model and algorithm
 
@@ -190,17 +190,6 @@ Found while porting it (2026-10-17). The bugs are fixed in `src/krgk_creep.cpp`,
    - `krgk_creep` keeps a hash set of expanded configurations and is ~55 times faster on the regression case: 22 events in 1.1 s against 60 s.
 2. Each key stores a `vector<bitset<2>>`, which takes 8 bytes per slope (`sizeof(bitset<2>) == 8`). The 2-bit slopes are thus stored in 64 bits each. `krgk_creep` packs them into ⌈log₂(2·mcut+1)⌉ bits.
 3. The barrier search printed several lines per expansion (867 000 lines in one minute at L = 16).
-
-## Suggested improvements
-
-All done (see [Implementation](#model-and-algorithm)); each gives the same events as before, which the regression test checks.
-
-
-1. **Lazy children** (done). Store (E, mother, block move) in the queue instead of the full child configuration, and build the child only when it is taken. The queue holds ~L² children per expansion; at L = 64 the memory (186 MB for 20 events) is the limit, not the time.
-2. **Upper bound on the barrier** (done, as an energy cap). Prune the children with E − E(α) above a bound of the barrier. This is the role of the unused `Wmax` argument of the original. Instead of a first path, the bound is a cap raised until the search succeeds, which is exact.
-3. **Faster forward relaxation** (done). Each move scanned all O(L²) blocks from the shortest. Now it keeps the same moves and order, with prefix sums, skipped clean blocks and an O(L) test. This is the relaxation of [creep-minimal-rearrangement](https://github.com/droyktton/creep-minimal-rearrangement), tested there against the plain scan.
-4. **Non-periodic disorder in u** (done: `--rng philox --M 0`). With period M, after the line advances by M the sequence of events repeats exactly.
-5. **Correlated disorder** (done: `--xi-x`, `--xi-u`). It sets the correlation lengths independently of the lattice.
 
 ## References
 
