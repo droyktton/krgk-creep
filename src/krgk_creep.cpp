@@ -36,8 +36,11 @@ struct Params {
 	bool f_absolute = false;
 	unsigned long seed = 12345;
 	long events = 100;
+	double advance = 0;       // stop earlier, once the mean position has advanced by this much
 	int limit = 5;            // search envelope: u_i <= alpha_i + limit*M
 	int conf_every = 0;       // write the metastable configuration every n events (0: never)
+	bool save_events = false; // write alpha, saddle, beta and gamma of every event
+	bool ground = false;      // compute the ground state at F = 0
 	std::string out = ".";
 };
 
@@ -136,8 +139,9 @@ public:
 
 	// Critical force with the procedure of the original (find_critical): starting from u = 0 and
 	// the initial F, relax backward; then advance forward by 2M, raising F by (dmin + PRECISION_FC)
-	// whenever no forward move lowers the energy. F_c = F - PRECISION_FC at the end.
-	double critical_force(double F0)
+	// whenever no forward move lowers the energy. F_c = F - PRECISION_FC at the end, and the
+	// critical configuration (crit) is the one that blocked the line at the last raise of F.
+	double critical_force(double F0, std::vector<int> &crit)
 	{
 		F = F0;
 		std::fill(u.begin(), u.end(), 0);
@@ -149,11 +153,47 @@ public:
 			auto advanced = [&]() { int m = u[0] - u0[0]; for (int i = 1; i < L; i++) m = std::min(m, u[i] - u0[i]); return m; };
 			while (advanced() < 2 * M) {
 				double d = move(+1);
-				if (d >= 0.0) { F += d + PRECISION_FC; count++; }
+				if (d >= 0.0) { F += d + PRECISION_FC; count++; crit = u; }
 			}
 			if (count == 0) { F -= 5.0 * PRECISION_FC; for (auto &x : u) x -= 2 * M; }
 		}
 		return F - PRECISION_FC;
+	}
+
+	// Ground state at F = 0 by transfer matrix: for each u_0 in [0, M), the minimal energy of the
+	// periodic line (u_L = u_0) over u_i in [u_0 - W, u_0 + W], W = L mcut / 2 (the largest
+	// displacement a periodic line with slopes <= mcut can reach). Cost O(M L W mcut).
+	std::vector<int> ground_state() const
+	{
+		const int W = L * mcut / 2, n = 2 * W + 1;
+		double Ebest = BIG;
+		std::vector<int> best;
+		std::vector<double> e(n), e2(n);
+		std::vector<int> from((size_t)L * n);
+		for (int u0 = 0; u0 < M; u0++) {
+			std::fill(e.begin(), e.end(), BIG);
+			e[W] = pot(0, u0);
+			for (int i = 1; i <= L; i++) {
+				for (int k = 0; k < n; k++) {
+					e2[k] = BIG;
+					for (int d = -mcut; d <= mcut; d++) {
+						int k0 = k - d;
+						if (k0 < 0 || k0 >= n || e[k0] >= BIG) continue;
+						double v = e[k0] + c * 0.5 * d * d;
+						if (v < e2[k]) { e2[k] = v; from[(size_t)(i - 1) * n + k] = k0; }
+					}
+					if (i < L && e2[k] < BIG) e2[k] += pot(i, u0 - W + k);
+				}
+				e.swap(e2);
+			}
+			if (e[W] < Ebest) {
+				Ebest = e[W];
+				best.assign(L, 0);
+				int k = W;
+				for (int i = L; i >= 1; i--) { k = from[(size_t)(i - 1) * n + k]; best[i - 1] = u0 - W + k; }
+			}
+		}
+		return best;
 	}
 
 	// Compact key of a configuration: u_0 and the slopes, each in ceil(log2(2 mcut + 1)) bits.
@@ -195,9 +235,10 @@ public:
 	};
 
 	// Creep step from the current (metastable) configuration alpha. On return u is gamma, beta is
-	// the last configuration taken from the queue (before its relaxation into gamma), and the
-	// barrier max(E) - E(alpha) is returned; BIG if the envelope stops the search.
-	double creep_step(std::vector<int> &beta, int limit, long &expanded)
+	// the last configuration taken from the queue (before its relaxation into gamma), saddle is
+	// the highest-energy configuration taken from the queue (the one that sets the barrier), and
+	// the barrier max(E) - E(alpha) is returned; BIG if the envelope stops the search.
+	double creep_step(std::vector<int> &beta, std::vector<int> &saddle, int limit, long &expanded)
 	{
 		const std::vector<int> alpha = u;
 		std::vector<int> lim(L);
@@ -234,7 +275,7 @@ public:
 			closed.insert(n.k);
 			expanded++;
 			u = unkey(n.k);
-			UB = std::max(UB, n.E - E0);
+			if (n.E - E0 > UB || expanded == 1) { UB = std::max(UB, n.E - E0); saddle = u; }
 			beta = u;
 			relax_forward();
 		} while (energy(u) > E0);
@@ -254,8 +295,11 @@ static void usage(const char *prog)
 	          << "  --absolute     --f is the absolute force F\n"
 	          << "  --seed N       random seed                               [12345]\n"
 	          << "  --events N     number of creep steps                     [100]\n"
+	          << "  --advance X    stop once the mean position advanced by X [0: off]\n"
 	          << "  --limit N      search envelope u <= alpha + N*M          [5]\n"
 	          << "  --conf-every N write the metastable state every N steps  [0: never]\n"
+	          << "  --save-events  write alpha, saddle, beta, gamma of every step to events.bin\n"
+	          << "  --ground       write the ground state at F = 0 to ground_state.dat\n"
 	          << "  --out DIR      output directory                          [.]\n";
 }
 
@@ -276,6 +320,9 @@ int main(int argc, char **argv)
 		else if (o == "--events") p.events = std::stol(val());
 		else if (o == "--limit") p.limit = std::stoi(val());
 		else if (o == "--conf-every") p.conf_every = std::stoi(val());
+		else if (o == "--save-events") p.save_events = true;
+		else if (o == "--ground") p.ground = true;
+		else if (o == "--advance") p.advance = std::stod(val());
 		else if (o == "--out") p.out = val();
 		else { usage(argv[0]); return 1; }
 	}
@@ -283,7 +330,8 @@ int main(int argc, char **argv)
 
 	Line line(p);
 	// F_c is located starting from F = --f, as the original does (it reads F/F_c as the initial F).
-	double Fc = line.critical_force(p.f);
+	std::vector<int> crit(p.L);
+	double Fc = line.critical_force(p.f, crit);
 	line.F = p.f_absolute ? p.f : p.f * Fc;
 	std::fill(line.u.begin(), line.u.end(), 0);
 	line.relax_forward();
@@ -291,18 +339,28 @@ int main(int argc, char **argv)
 	std::ofstream log(p.out + "/params.txt");
 	log << "L " << p.L << "\nM " << p.M << "\nmcut " << p.mcut << "\ndisorder " << p.disorder << "\nc " << p.c
 	    << "\nf " << p.f << (p.f_absolute ? " (absolute)" : " (F/Fc)") << "\nseed " << p.seed << "\nlimit " << p.limit
-	    << "\nFc " << Fc << "\nF " << line.F << "\n";
+	    << "\nFc " << Fc << "\nF " << line.F << std::endl;
+	auto write_conf = [&](const std::string &name, const std::vector<int> &x) {
+		std::ofstream o(p.out + "/" + name);
+		for (int v : x) o << v << "\n";
+	};
+	write_conf("critical.dat", crit);
+	if (p.ground) write_conf("ground_state.dat", line.ground_state());
 	std::ofstream ev(p.out + "/events.dat");
 	ev << "# step barrier L_opt L_rel area mean_u E expanded\n";
 	ev.precision(10);
 	std::ofstream conf;
 	if (p.conf_every > 0) conf.open(p.out + "/configs.bin", std::ios::binary);
+	std::ofstream evconf;
+	if (p.save_events) evconf.open(p.out + "/events.bin", std::ios::binary);
 
-	std::vector<int> alpha, beta(p.L);
+	std::vector<int> alpha, beta(p.L), saddle(p.L);
+	double u_start = 0;
+	for (int v : line.u) u_start += (double)v / p.L;
 	for (long s = 1; s <= p.events; s++) {
 		alpha = line.u;
 		long expanded;
-		double UB = line.creep_step(beta, p.limit, expanded);
+		double UB = line.creep_step(beta, saddle, p.limit, expanded);
 		if (UB >= BIG) { std::cerr << "step " << s << ": no lower state inside the envelope (raise --limit)\n"; return 2; }
 		int Lopt = 0, Lrel = 0;
 		long area = 0, sum = 0;
@@ -313,8 +371,11 @@ int main(int argc, char **argv)
 			sum += line.u[i];
 		}
 		ev << s << " " << UB << " " << Lopt << " " << Lrel << " " << area << " " << (double)sum / p.L << " "
-		   << line.energy(line.u) << " " << expanded << "\n";
+		   << line.energy(line.u) << " " << expanded << std::endl;
+		if (p.save_events)
+			for (const auto *x : {&alpha, &saddle, &beta, &line.u}) evconf.write((const char *)x->data(), sizeof(int) * p.L);
 		if (p.conf_every > 0 && s % p.conf_every == 0) conf.write((const char *)line.u.data(), sizeof(int) * p.L);
+		if (p.advance > 0 && (double)sum / p.L - u_start >= p.advance) break;
 	}
 	return 0;
 }

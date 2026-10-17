@@ -15,6 +15,7 @@ This repository keeps the original code and a clean, faster reimplementation of 
 | `tests/regression.sh` | compares `krgk_creep` with the original code on the same disorder |
 | `original/vmc/` | the original code (C++, Blitz++, serial), from `cuerdas_elasticas/vmc` (bitbucket `abk_balde/cuerdas_elasticas`, last change 2019), unmodified |
 | `original/common/` | helpers of that repository (the large safe-prime tables were left out) |
+| `demo/` | demo runs and figures (`demo/run_demo.sh`, `demo/plot_demo.py`, `demo/figures/`) |
 | `original/patches/vmc-return.patch` | the one-line fix the original needs to run when compiled with optimisation (see [Review](#review-of-the-original-code)) |
 
 ## Build and run
@@ -37,8 +38,11 @@ Options (`build/krgk_creep --help`):
 | `--f` | drive F/F_c (F with `--absolute`) | 0.08 |
 | `--seed` | random seed | 12345 |
 | `--events` | number of creep steps | 100 |
+| `--advance` | stop earlier, once the mean position has advanced by this much | 0 (off) |
 | `--limit` | search envelope u ≤ α + limit·M | 5 |
 | `--conf-every` | write the metastable state every n steps to `configs.bin` (int32, L per record) | 0 (never) |
+| `--save-events` | write α, saddle, β and γ of every step to `events.bin` | off |
+| `--ground` | compute the ground state at F = 0 (`ground_state.dat`) | off |
 | `--out` | output directory | `.` |
 
 Outputs:
@@ -52,6 +56,56 @@ Outputs:
   - `mean_u`;
   - `E`: energy of γ;
   - `expanded`: configurations expanded by the search.
+- `critical.dat`: the critical configuration, the one that blocks the line at the last raise of F when locating F_c (one u_i per line).
+- `ground_state.dat` (with `--ground`): the ground state at F = 0, by transfer matrix over u_0 ∈ [0, M) and u_i − u_0 ∈ [−L·mcut/2, L·mcut/2], with u_L = u_0. Cost O(M·L²·mcut²).
+- `events.bin` (with `--save-events`): for each step, four int32 records of L values:
+  - α, the metastable state before the step;
+  - the saddle, the configuration with the highest energy taken from the queue, which sets U_B;
+  - β, the last configuration taken from the queue, before its relaxation;
+  - γ, the new metastable state.
+
+## Demo
+
+`demo/run_demo.sh` runs the examples below (about 15 minutes with 3 parallel jobs) and `demo/plot_demo.py` makes the figures.
+
+### One disorder realization
+
+L = 32, disorder periodic in u with M = 64, seed 7, f = F/F_c = 0.15 to 0.9. Each run continues until the line has advanced by 3M.
+
+Because the disorder is periodic, the steady state is a periodic cycle of metastable states: γ_{n+P} = γ_n + M. At T → 0⁺ the time spent in a state grows as exp(U_B/T). The cycle is therefore dominated by the state with the largest barrier, the **dominant configuration**.
+
+![one realization](demo/figures/single_realization.png)
+
+- (a) The metastable states of one period at f = 0.4, and the event that leaves the dominant state (α, saddle, γ).
+- (b) The barriers along one period.
+- (c) The dominant configuration at each f, the ground state at F = 0, and the critical configuration at F_c. Configurations are shifted by multiples of M to the nearest copy of the ground state.
+- (d) The barrier of every state of the cycle against its rms distance to the ground state.
+
+For this sample:
+
+| f | period (events) | dominant U_B | rms distance to ground state | rms distance to critical |
+|---|---|---|---|---|
+| 0.15 | 144 | 4.35 | 21.3 | 18.4 |
+| 0.25 | 155 | 3.44 | 21.3 | 18.4 |
+| 0.4 | 134 | 2.19 | 10.6 | 13.4 |
+| 0.6 | 58 | 1.73 | 3.3 | 1.9 |
+| 0.9 | 3 | 0.34 | 3.5 | 0.0 |
+
+- Near F_c the dominant configuration is the critical one.
+- At f = 0.15 and 0.25 the dominant state lies in another valley. The state of the cycle closest to the ground state (rms distance 1.5) has the second largest barrier at f = 0.15 (4.11, against 4.35). Reaching the f → 0 limit, where the dominant state should approach the ground state, needs lower f, and the cost of the search grows quickly as f decreases.
+
+### Steady-state statistics
+
+L = 64, f = 0.6, three realizations, M = 16384 so that the disorder never repeats (the advance is 6000). The first advance of 1000 is discarded; 16 406 events remain.
+
+![statistics](demo/figures/statistics.png)
+
+- (a) Structure factor of the metastable states.
+- (b–d) Distributions of L_rel, area and U_B.
+- (e) Area against L_rel.
+- (f) U_B against L_opt.
+
+At this drive the excitations are small (L_opt mostly 1–10 sites) and their barrier hardly depends on L_opt. The asymptotic creep regime needs L_opt ≫ 1, that is lower f and larger L. Lazy children (below) are the first step to make that affordable.
 
 ## Model and algorithm
 
