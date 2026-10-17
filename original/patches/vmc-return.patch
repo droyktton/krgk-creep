@@ -1,0 +1,11 @@
+--- a/vmc/vmc.cpp
++++ b/vmc/vmc.cpp
+@@ -8,7 +8,7 @@
+ 
+ Real sistemavmc::VMC(int idir)
+ {
+-	VMC(idir, 0.0, 0.0);
++	return VMC(idir, 0.0, 0.0);
+ }
+ 
+ //#define EPS
